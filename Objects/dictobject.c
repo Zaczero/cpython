@@ -124,6 +124,7 @@ As a consequence of this, split keys have a maximum size of 16.
 #include "pycore_dict.h"          // export _PyDict_SizeOf()
 #include "pycore_freelist.h"      // _PyFreeListState_GET()
 #include "pycore_gc.h"            // _PyObject_GC_IS_TRACKED()
+#include "pycore_modsupport.h"    // _PyArg_CheckPositional()
 #include "pycore_object.h"        // _PyObject_GC_TRACK(), _PyDebugAllocatorStats()
 #include "pycore_pyatomic_ft_wrappers.h" // FT_ATOMIC_LOAD_SSIZE_RELAXED
 #include "pycore_pyerrors.h"      // _PyErr_GetRaisedException()
@@ -5019,6 +5020,7 @@ PyTypeObject PyDict_Type = {
     .tp_version_tag = _Py_TYPE_VERSION_DICT,
 };
 
+
 /* For backward compatibility with old dictionary interface */
 
 PyObject *
@@ -7800,3 +7802,376 @@ _PyObject_InlineValuesConsistencyCheck(PyObject *obj)
     return 0;
 }
 #endif
+
+
+typedef struct {
+    PyObject_HEAD
+    PyObject *fd_dict;   /* Owned reference to the backing dict. */
+    Py_hash_t fd_hash;   /* Cached hash value, -1 while mutable/not frozen. */
+} PyFrozenDictObject;
+
+static int
+frozendict_traverse(PyObject *self, visitproc visit, void *arg)
+{
+    PyFrozenDictObject *fd = _Py_CAST(PyFrozenDictObject *, self);
+    Py_VISIT(fd->fd_dict);
+    return 0;
+}
+
+static int
+frozendict_clear(PyObject *self)
+{
+    PyFrozenDictObject *fd = _Py_CAST(PyFrozenDictObject *, self);
+    Py_CLEAR(fd->fd_dict);
+    return 0;
+}
+
+static void
+frozendict_dealloc(PyObject *self)
+{
+    PyObject_GC_UnTrack(self);
+    (void)frozendict_clear(self);
+    PyObject_GC_Del(self);
+}
+
+static Py_ssize_t
+frozendict_length(PyObject *self)
+{
+    PyFrozenDictObject *fd = _Py_CAST(PyFrozenDictObject *, self);
+    return fd->fd_dict ? PyDict_GET_SIZE(fd->fd_dict) : 0;
+}
+
+static PyObject *
+frozendict_subscript(PyObject *self, PyObject *key)
+{
+    PyFrozenDictObject *fd = _Py_CAST(PyFrozenDictObject *, self);
+    PyObject *value = PyDict_GetItemWithError(fd->fd_dict, key);
+    if (value == NULL) {
+        if (!PyErr_Occurred()) {
+            PyErr_SetObject(PyExc_KeyError, key);
+        }
+        return NULL;
+    }
+    return Py_NewRef(value);
+}
+
+static PyMappingMethods frozendict_as_mapping = {
+    .mp_length = frozendict_length,
+    .mp_subscript = frozendict_subscript,
+};
+
+static int
+frozendict_contains(PyObject *self, PyObject *key)
+{
+    PyFrozenDictObject *fd = _Py_CAST(PyFrozenDictObject *, self);
+    return PyDict_Contains(fd->fd_dict, key);
+}
+
+static PySequenceMethods frozendict_as_sequence = {
+    .sq_contains = frozendict_contains,
+};
+
+static PyObject *
+frozendict_iter(PyObject *self)
+{
+    PyFrozenDictObject *fd = _Py_CAST(PyFrozenDictObject *, self);
+    return PyObject_GetIter(fd->fd_dict);
+}
+
+static PyObject *
+frozendict_repr(PyObject *self)
+{
+    PyFrozenDictObject *fd = _Py_CAST(PyFrozenDictObject *, self);
+    return PyUnicode_FromFormat("frozendict(%R)", fd->fd_dict);
+}
+
+/* Match the dispersion strategy of frozenset hashing to lean on its tuning. */
+static inline Py_uhash_t
+frozendict_shuffle_bits(Py_uhash_t h)
+{
+    return ((h ^ 89869747UL) ^ (h << 16)) * 3644798167UL;
+}
+
+static int
+frozendict_compute_hash(PyFrozenDictObject *fd)
+{
+    Py_ssize_t pos = 0;
+    PyObject *key, *value;
+    Py_uhash_t h = 0;
+    while (PyDict_Next(fd->fd_dict, &pos, &key, &value)) {
+        Py_hash_t kh = PyObject_Hash(key);
+        if (kh == -1) {
+            return -1;
+        }
+        Py_hash_t vh = PyObject_Hash(value);
+        if (vh == -1) {
+            return -1;
+        }
+        Py_uhash_t pair_hash = (Py_uhash_t)kh ^ ((Py_uhash_t)vh << 1);
+        h ^= frozendict_shuffle_bits(pair_hash);
+    }
+    h ^= ((Py_uhash_t)PyDict_GET_SIZE(fd->fd_dict) + 1) * 1927868237UL;
+    h ^= (h >> 11) ^ (h >> 25);
+    h = h * 69069U + 907133923UL;
+    if (h == (Py_uhash_t)-1) {
+        h = 1530891417UL;
+    }
+
+    fd->fd_hash = (Py_hash_t)h;
+    return 0;
+}
+
+static Py_hash_t
+frozendict_hash(PyObject *self)
+{
+    PyFrozenDictObject *fd = _Py_CAST(PyFrozenDictObject *, self);
+    if (fd->fd_hash == -1) {
+        PyErr_SetString(PyExc_TypeError, "frozendict is not frozen");
+        return -1;
+    }
+    return fd->fd_hash;
+}
+
+static PyObject *
+frozendict_richcompare(PyObject *self, PyObject *other, int op)
+{
+    if (!PyAnySet_Check(other) && !PyDict_Check(other) &&
+        !PyFrozenDict_CheckExact(other)) {
+        Py_RETURN_NOTIMPLEMENTED;
+    }
+    PyObject *lhs = _Py_CAST(PyFrozenDictObject *, self)->fd_dict;
+    PyObject *rhs = other;
+    if (PyFrozenDict_CheckExact(other)) {
+        rhs = _Py_CAST(PyFrozenDictObject *, other)->fd_dict;
+    }
+    return dict_richcompare(lhs, rhs, op);
+}
+
+static PyObject *
+frozendict_keys(PyObject *self, PyObject *Py_UNUSED(ignored))
+{
+    PyFrozenDictObject *fd = _Py_CAST(PyFrozenDictObject *, self);
+    return _PyDictView_New(fd->fd_dict, &PyDictKeys_Type);
+}
+
+static PyObject *
+frozendict_items(PyObject *self, PyObject *Py_UNUSED(ignored))
+{
+    PyFrozenDictObject *fd = _Py_CAST(PyFrozenDictObject *, self);
+    return _PyDictView_New(fd->fd_dict, &PyDictItems_Type);
+}
+
+static PyObject *
+frozendict_values(PyObject *self, PyObject *Py_UNUSED(ignored))
+{
+    PyFrozenDictObject *fd = _Py_CAST(PyFrozenDictObject *, self);
+    return _PyDictView_New(fd->fd_dict, &PyDictValues_Type);
+}
+
+static PyObject *
+frozendict_get(PyObject *self, PyObject *const *args, Py_ssize_t nargs)
+{
+    if (!_PyArg_CheckPositional("get", nargs, 1, 2)) {
+        return NULL;
+    }
+    PyObject *key = args[0];
+    PyObject *deflt = nargs == 2 ? args[1] : Py_None;
+    PyObject *value = PyDict_GetItemWithError(_Py_CAST(PyFrozenDictObject *, self)->fd_dict, key);
+    if (value != NULL) {
+        return Py_NewRef(value);
+    }
+    if (PyErr_Occurred()) {
+        return NULL;
+    }
+    return Py_NewRef(deflt);
+}
+
+static PyObject *
+frozendict_reduce(PyObject *self, PyObject *Py_UNUSED(ignored))
+{
+    PyFrozenDictObject *fd = _Py_CAST(PyFrozenDictObject *, self);
+    PyObject *copy = PyDict_Copy(fd->fd_dict);
+    if (copy == NULL) {
+        return NULL;
+    }
+    PyObject *args = PyTuple_Pack(1, copy);
+    Py_DECREF(copy);
+    if (args == NULL) {
+        return NULL;
+    }
+    PyObject *result = PyTuple_Pack(2, (PyObject *)Py_TYPE(self), args);
+    Py_DECREF(args);
+    return result;
+}
+
+static PyMethodDef frozendict_methods[] = {
+    {"keys", (PyCFunction)frozendict_keys, METH_NOARGS, NULL},
+    {"items", (PyCFunction)frozendict_items, METH_NOARGS, NULL},
+    {"values", (PyCFunction)frozendict_values, METH_NOARGS, NULL},
+    {"get", _PyCFunction_CAST(frozendict_get), METH_FASTCALL, NULL},
+    {"__reduce__", (PyCFunction)frozendict_reduce, METH_NOARGS, NULL},
+    {NULL, NULL, 0, NULL}
+};
+
+PyDoc_STRVAR(frozendict_doc,
+"frozendict() -> empty frozendict\n"
+"frozendict(mapping, /, **kwargs) -> immutable copy of mapping\n"
+"frozendict(iterable, /, **kwargs) -> from an iterable of (key, value) pairs\n"
+"frozendict(**kwargs) -> mapping built from keyword arguments\n"
+"\n"
+"Return an immutable mapping containing the supplied key/value pairs. Keys\n"
+"and values must be hashable; TypeError is raised otherwise. The result\n"
+"preserves insertion order, provides the standard read-only mapping API, and\n"
+"is itself hashable.\n");
+
+static PyObject *
+frozendict_from_dict(PyTypeObject *type, PyObject *dict)
+{
+    PyFrozenDictObject *fd = PyObject_GC_New(PyFrozenDictObject, type);
+    if (fd == NULL) {
+        return NULL;
+    }
+    fd->fd_dict = dict;
+    if (frozendict_compute_hash(fd) < 0) {
+        Py_DECREF(fd);
+        return NULL;
+    }
+    PyObject_GC_Track(fd);
+    return _Py_CAST(PyObject *, fd);
+}
+
+static PyObject *
+frozendict_vectorcall(PyObject *type, PyObject *const *args,
+                      size_t nargsf, PyObject *kwnames)
+{
+    Py_ssize_t nargs = PyVectorcall_NARGS(nargsf);
+    if (!_PyArg_CheckPositional("frozendict", nargs, 0, 1)) {
+        return NULL;
+    }
+    if (nargs == 1 &&
+        (kwnames == NULL || PyTuple_GET_SIZE(kwnames) == 0) &&
+        Py_TYPE(args[0]) == _PyType_CAST(type))
+    {
+        return Py_NewRef(args[0]);
+    }
+    PyObject *dict = PyObject_Vectorcall((PyObject *)&PyDict_Type, args, nargsf, kwnames);
+    if (dict == NULL) {
+        return NULL;
+    }
+    PyObject *result = frozendict_from_dict(_PyType_CAST(type), dict);
+    if (result == NULL) {
+        Py_DECREF(dict);
+        return NULL;
+    }
+    return result;
+}
+
+static PyObject *
+frozendict_new(PyTypeObject *type, PyObject *args, PyObject *kwds)
+{
+    if (PyTuple_GET_SIZE(args) == 1 &&
+        (kwds == NULL || PyDict_GET_SIZE(kwds) == 0)) {
+        PyObject *arg0 = PyTuple_GET_ITEM(args, 0);
+        if (Py_TYPE(arg0) == type) {
+            return Py_NewRef(arg0);
+        }
+    }
+    PyObject *dict = PyObject_Call((PyObject *)&PyDict_Type, args, kwds);
+    if (dict == NULL) {
+        return NULL;
+    }
+    PyObject *result = frozendict_from_dict(type, dict);
+    if (result == NULL) {
+        Py_DECREF(dict);
+    }
+    return result;
+}
+
+PyTypeObject PyFrozenDict_Type = {
+    PyVarObject_HEAD_INIT(&PyType_Type, 0)
+    .tp_name = "frozendict",
+    .tp_basicsize = sizeof(PyFrozenDictObject),
+    .tp_itemsize = 0,
+    .tp_dealloc = frozendict_dealloc,
+    .tp_repr = frozendict_repr,
+    .tp_hash = frozendict_hash,
+    .tp_getattro = PyObject_GenericGetAttr,
+    .tp_flags = Py_TPFLAGS_DEFAULT | Py_TPFLAGS_HAVE_GC |
+                Py_TPFLAGS_IMMUTABLETYPE | Py_TPFLAGS_MAPPING |
+                Py_TPFLAGS_HAVE_VECTORCALL,
+    .tp_doc = frozendict_doc,
+    .tp_traverse = frozendict_traverse,
+    .tp_clear = frozendict_clear,
+    .tp_richcompare = frozendict_richcompare,
+    .tp_iter = frozendict_iter,
+    .tp_methods = frozendict_methods,
+    .tp_as_mapping = &frozendict_as_mapping,
+    .tp_as_sequence = &frozendict_as_sequence,
+    .tp_new = frozendict_new,
+    .tp_free = PyObject_GC_Del,
+    .tp_vectorcall = frozendict_vectorcall,
+};
+
+int
+_PyFrozenDict_CheckExact(PyObject *op)
+{
+    return Py_IS_TYPE(op, &PyFrozenDict_Type);
+}
+
+PyObject *
+_PyFrozenDict_NewPresized(Py_ssize_t n)
+{
+    PyFrozenDictObject *fd = PyObject_GC_New(PyFrozenDictObject, &PyFrozenDict_Type);
+    if (fd == NULL) {
+        return NULL;
+    }
+    fd->fd_dict = _PyDict_NewPresized(n);
+    if (fd->fd_dict == NULL) {
+        PyObject_GC_Del(fd);
+        return NULL;
+    }
+    fd->fd_hash = -1;
+    PyObject_GC_Track(fd);
+    return _Py_CAST(PyObject *, fd);
+}
+
+int
+_PyFrozenDict_SetItem(PyObject *op, PyObject *key, PyObject *value)
+{
+    if (!PyFrozenDict_CheckExact(op)) {
+        PyErr_BadInternalCall();
+        return -1;
+    }
+    PyFrozenDictObject *fd = _Py_CAST(PyFrozenDictObject *, op);
+    if (fd->fd_hash != -1) {
+        PyErr_SetString(PyExc_TypeError, "frozendict is frozen");
+        return -1;
+    }
+    return PyDict_SetItem(fd->fd_dict, key, value);
+}
+
+int
+_PyFrozenDict_Freeze(PyObject *op)
+{
+    if (!PyFrozenDict_CheckExact(op)) {
+        PyErr_BadInternalCall();
+        return -1;
+    }
+    PyFrozenDictObject *fd = _Py_CAST(PyFrozenDictObject *, op);
+    if (fd->fd_hash != -1) {
+        PyErr_SetString(PyExc_TypeError, "frozendict is already frozen");
+        return -1;
+    }
+    return frozendict_compute_hash(fd);
+}
+
+int
+_PyFrozenDict_Next(PyObject *op, Py_ssize_t *pos, PyObject **key, PyObject **value)
+{
+    if (!PyFrozenDict_CheckExact(op)) {
+        PyErr_BadInternalCall();
+        return 0;
+    }
+    PyFrozenDictObject *fd = _Py_CAST(PyFrozenDictObject *, op);
+    return PyDict_Next(fd->fd_dict, pos, key, value);
+}

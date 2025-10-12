@@ -114,6 +114,14 @@ class InMemoryPickleTests(AbstractPickleTests, AbstractUnpickleTests,
     test_find_class = None
     test_custom_find_class = None
 
+    def test_frozendict(self):
+        obj = frozendict({'a': 1, 'b': 2})
+        for proto in range(pickle.HIGHEST_PROTOCOL + 1):
+            dumped = self.dumps(obj, proto)
+            loaded = self.loads(dumped)
+            self.assertIsInstance(loaded, frozendict)
+            self.assertEqual(loaded, obj)
+
 
 class PersistentPicklerUnpicklerMixin(object):
 

@@ -825,6 +825,7 @@ class Mapping(Collection):
 
 Mapping.register(mappingproxy)
 Mapping.register(framelocalsproxy)
+Mapping.register(frozendict)
 
 
 class MappingView(Sized):

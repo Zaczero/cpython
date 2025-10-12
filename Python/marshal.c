@@ -9,6 +9,7 @@
 #include "Python.h"
 #include "pycore_call.h"             // _PyObject_CallNoArgs()
 #include "pycore_code.h"             // _PyCode_New()
+#include "pycore_dict.h"             // _PyFrozenDict_*
 #include "pycore_hashtable.h"        // _Py_hashtable_t
 #include "pycore_long.h"             // _PyLong_IsZero()
 #include "pycore_pystate.h"          // _PyInterpreterState_GET()
@@ -74,6 +75,8 @@ module marshal
 #define TYPE_FROZENSET          '>'
 // added in version 5:
 #define TYPE_SLICE              ':'
+// added in version 6:
+#define TYPE_FROZENDICT         '}'
 // Remember to update the version and documentation when adding new types.
 
 /* Special cases for unicode strings (added in version 4) */
@@ -581,6 +584,21 @@ w_complex_object(PyObject *v, char flag, WFILE *p)
             w_object(value, p);
         }
         w_object((PyObject *)NULL, p);
+    }
+    else if (_PyFrozenDict_CheckExact(v)) {
+        Py_ssize_t pos = 0;
+        PyObject *key, *value;
+        Py_ssize_t n = PyMapping_Size(v);
+        if (n < 0) {
+            p->error = WFERR_UNMARSHALLABLE;
+            return;
+        }
+        W_TYPE(TYPE_FROZENDICT, p);
+        W_SIZE(n, p);
+        while (_PyFrozenDict_Next(v, &pos, &key, &value)) {
+            w_object(key, p);
+            w_object(value, p);
+        }
     }
     else if (PyAnySet_CheckExact(v)) {
         PyObject *value;
@@ -1438,6 +1456,47 @@ r_object(RFILE *p)
             Py_DECREF(val);
         }
         if (PyErr_Occurred()) {
+            Py_SETREF(v, NULL);
+        }
+        retval = v;
+        break;
+
+    case TYPE_FROZENDICT:
+        n = r_long(p);
+        if (n < 0 || n > SIZE32_MAX) {
+            if (!PyErr_Occurred()) {
+                PyErr_SetString(PyExc_ValueError,
+                                "bad marshal data (frozendict size out of range)");
+            }
+            break;
+        }
+        v = _PyFrozenDict_NewPresized(n);
+        R_REF(v);
+        if (v == NULL) {
+            break;
+        }
+        for (i = 0; i < n; i++) {
+            PyObject *key = r_object(p);
+            if (key == NULL) {
+                Py_SETREF(v, NULL);
+                break;
+            }
+            PyObject *val = r_object(p);
+            if (val == NULL) {
+                Py_DECREF(key);
+                Py_SETREF(v, NULL);
+                break;
+            }
+            if (_PyFrozenDict_SetItem(v, key, val) < 0) {
+                Py_DECREF(key);
+                Py_DECREF(val);
+                Py_SETREF(v, NULL);
+                break;
+            }
+            Py_DECREF(key);
+            Py_DECREF(val);
+        }
+        if (v != NULL && _PyFrozenDict_Freeze(v) < 0) {
             Py_SETREF(v, NULL);
         }
         retval = v;

@@ -212,6 +212,12 @@ class BuiltinTest(ComplexesAreIdenticalMixin, unittest.TestCase):
                 return -5
         self.assertEqual(abs(AbsClass()), -5)
 
+    def test_frozendict_builtin(self):
+        fd = frozendict({'a': 1}, b=2)
+        self.assertEqual(dict(fd), {'a': 1, 'b': 2})
+        self.assertIsInstance(fd, collections.abc.Mapping)
+        self.assertIs(frozendict(fd), fd)
+
     def test_all(self):
         self.assertEqual(all([2, 4, 6]), True)
         self.assertEqual(all([2, None, 6]), False)

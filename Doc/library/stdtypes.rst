@@ -4911,8 +4911,8 @@ Mapping Types --- :class:`dict`
    pair: built-in function; len
 
 A :term:`mapping` object maps :term:`hashable` values to arbitrary objects.
-Mappings are mutable objects.  There is currently only one standard mapping
-type, the :dfn:`dictionary`.  (For other containers see the built-in
+The standard mutable mapping type is the :dfn:`dictionary`.  For an immutable
+mapping, see :class:`frozendict`.  (For other containers see the built-in
 :class:`list`, :class:`set`, and :class:`tuple` classes, and the
 :mod:`collections` module.)
 
@@ -4995,6 +4995,21 @@ can be used interchangeably to index the same dictionary entry.
    .. versionchanged:: 3.7
       Dictionary order is guaranteed to be insertion order.  This behavior was
       an implementation detail of CPython from 3.6.
+
+.. class:: frozendict(mapping=None, /, **kwargs)
+   :noindex:
+
+   Return an immutable mapping containing the supplied key/value pairs. The
+   constructor accepts the same forms as :class:`dict`: no arguments for an
+   empty mapping, another mapping, an iterable of ``(key, value)`` pairs, or
+   keyword arguments.
+
+   Items preserve the insertion order of the source data. All keys and values
+   must be :term:`hashable`; otherwise :exc:`TypeError` is raised. Instances
+   implement the full read-only mapping API (for example ``x in fd``,
+   :meth:`frozendict.keys`, :meth:`frozendict.items`, :meth:`frozendict.get`) and
+   are themselves hashable, so they can serve as dictionary keys or be stored
+   in :class:`set` and :class:`frozenset` containers.
 
    These are the operations that dictionaries support (and therefore, custom
    mapping types should support too):

@@ -1,6 +1,7 @@
 #include "Python.h"
 #include "opcode.h"
 #include "pycore_c_array.h"       // _Py_CArray_EnsureCapacity
+#include "pycore_dict.h"          // _PyFrozenDict_NewPresized
 #include "pycore_flowgraph.h"
 #include "pycore_compile.h"
 #include "pycore_intrinsics.h"
@@ -1393,6 +1394,107 @@ nop_out(cfg_instr **instrs, int size)
     }
 }
 
+/* Build a dict object from a sequence of 2*n constant loads (key,value) that
+   immediately precede a BUILD_MAP. On success, replace those loads and the
+   BUILD_MAP with a single LOAD_CONST of the created dict.
+
+   This is safe to do only when the dict is immediately consumed in a way that
+   cannot expose its identity or allow mutation (e.g., GET_ITER, CONTAINS_OP,
+   or NB_SUBSCR).
+
+   Returns SUCCESS if folding succeeded or was not applicable, and ERROR on
+   actual errors (e.g., memory error).
+*/
+static int
+fold_build_map_to_const_dict(basicblock *bb, int i, int n,
+                             PyObject *consts, PyObject *const_cache)
+{
+    assert(n >= 0);
+    if (2*n > _PY_STACK_USE_GUIDELINE) {
+        return SUCCESS;
+    }
+
+    cfg_instr *const_instrs[_PY_STACK_USE_GUIDELINE];
+    if (!get_const_loading_instrs(bb, i-1, const_instrs, 2*n)) {
+        return SUCCESS;  /* not a pure literal */
+    }
+
+    PyObject *d = _PyFrozenDict_NewPresized(n);
+    if (d == NULL) {
+        return ERROR;
+    }
+    for (int j = 0; j < n; j++) {
+        cfg_instr *k = const_instrs[j*2];
+        cfg_instr *v = const_instrs[j*2 + 1];
+        PyObject *key = get_const_value(k->i_opcode, k->i_oparg, consts);
+        if (key == NULL) {
+            Py_DECREF(d);
+            return ERROR;
+        }
+        PyObject *val = get_const_value(v->i_opcode, v->i_oparg, consts);
+        if (val == NULL) {
+            Py_DECREF(key);
+            Py_DECREF(d);
+            return ERROR;
+        }
+        int err = _PyFrozenDict_SetItem(d, key, val);
+        Py_DECREF(key);
+        Py_DECREF(val);
+        if (err < 0) {
+            if (PyErr_ExceptionMatches(PyExc_TypeError)) {
+                PyErr_Clear();
+                Py_DECREF(d);
+                return SUCCESS;
+            }
+            Py_DECREF(d);
+            return ERROR;
+        }
+    }
+    if (_PyFrozenDict_Freeze(d) < 0) {
+        Py_DECREF(d);
+        return ERROR;
+    }
+
+    int idx = add_const(d, consts, const_cache);
+    if (idx < 0) {
+        return ERROR;
+    }
+    /* Remove contributing loads and turn BUILD_MAP into LOAD_CONST */
+    nop_out(const_instrs, 2*n);
+    INSTR_SET_OP1(&bb->b_instr[i], LOAD_CONST, idx);
+    return SUCCESS;
+}
+
+/* Generic optimizer for dict literals. Currently folds pure BUILD_MAP literals
+   into a LOAD_CONST dict when the dict is immediately consumed in an
+   ephemeral way (no identity escape or mutation possible): GET_ITER,
+   CONTAINS_OP, TO_BOOL, POP_TOP, GET_LEN, or BINARY_OP with NB_SUBSCR.
+ */
+static int
+optimize_dicts(basicblock *bb, int i, PyObject *consts, PyObject *const_cache)
+{
+    cfg_instr *inst = &bb->b_instr[i];
+    assert(inst->i_opcode == BUILD_MAP);
+
+    int nextop = (i+1 < bb->b_iused) ? bb->b_instr[i+1].i_opcode : 0;
+    if (
+        nextop == GET_ITER ||
+        nextop == CONTAINS_OP ||
+        nextop == TO_BOOL ||
+        nextop == POP_TOP ||
+        nextop == GET_LEN ||
+        nextop == POP_JUMP_IF_TRUE ||
+        nextop == POP_JUMP_IF_FALSE ||
+        nextop == DICT_UPDATE ||
+        nextop == DICT_MERGE ||
+        (nextop == BINARY_OP && bb->b_instr[i+1].i_oparg == NB_SUBSCR)
+    ) {
+        int n = inst->i_oparg;
+        RETURN_IF_ERROR(fold_build_map_to_const_dict(bb, i, n, consts, const_cache));
+    }
+    return SUCCESS;
+}
+
 /* Does not steal reference to "newconst".
    Return 1 if changed instruction to LOAD_SMALL_INT.
    Return 0 if could not change instruction to LOAD_SMALL_INT.
@@ -2332,6 +2434,9 @@ optimize_basic_block(PyObject *const_cache, basicblock *bb, PyObject *consts)
                     }
                 }
                 RETURN_IF_ERROR(fold_tuple_of_constants(bb, i, consts, const_cache));
+                break;
+            case BUILD_MAP:
+                RETURN_IF_ERROR(optimize_dicts(bb, i, consts, const_cache));
                 break;
             case BUILD_LIST:
             case BUILD_SET:

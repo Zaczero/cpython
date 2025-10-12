@@ -15,6 +15,7 @@
 #include "Python.h"
 #include "opcode.h"
 #include "pycore_ast.h"           // _PyAST_GetDocString()
+#include "pycore_dict.h"          // _PyFrozenDict_NewPresized
 #define NEED_OPCODE_TABLES
 #include "pycore_opcode_utils.h"
 #undef NEED_OPCODE_TABLES
@@ -3943,6 +3944,113 @@ maybe_optimize_function_call(compiler *c, expr_ty e, jump_target_label end)
     return optimized;
 }
 
+/*
+ * Dict-literal optimization helpers
+ * ---------------------------------
+ * Keep these near call/binop optimizations for locality and readability.
+ */
+static inline int
+is_pure_dict_literal(expr_ty dict_expr)
+{
+    if (dict_expr->kind != Dict_kind) {
+        return 0;
+    }
+    asdl_expr_seq *kseq = dict_expr->v.Dict.keys;
+    asdl_expr_seq *vseq = dict_expr->v.Dict.values;
+    Py_ssize_t n = asdl_seq_LEN(vseq);
+    for (Py_ssize_t i = 0; i < n; i++) {
+        expr_ty k = (expr_ty)asdl_seq_GET(kseq, i);
+        expr_ty v = (expr_ty)asdl_seq_GET(vseq, i);
+        if (k == NULL || k->kind != Constant_kind || v->kind != Constant_kind) {
+            return 0;
+        }
+    }
+    return 1;
+}
+
+static PyObject *
+build_const_dict_from_literal(expr_ty dict_expr)
+{
+    asdl_expr_seq *kseq = dict_expr->v.Dict.keys;
+    asdl_expr_seq *vseq = dict_expr->v.Dict.values;
+    Py_ssize_t n = asdl_seq_LEN(vseq);
+    PyObject *d = _PyFrozenDict_NewPresized(n);
+    if (d == NULL) {
+        return NULL;
+    }
+    for (Py_ssize_t i = 0; i < n; i++) {
+        PyObject *k = ((expr_ty)asdl_seq_GET(kseq, i))->v.Constant.value;
+        PyObject *v = ((expr_ty)asdl_seq_GET(vseq, i))->v.Constant.value;
+        if (_PyFrozenDict_SetItem(d, k, v) < 0) {
+            if (PyErr_ExceptionMatches(PyExc_TypeError)) {
+                PyErr_Clear();
+                Py_DECREF(d);
+                return NULL;
+            }
+            Py_DECREF(d);
+            return NULL;
+        }
+    }
+    if (_PyFrozenDict_Freeze(d) < 0) {
+        Py_DECREF(d);
+        return NULL;
+    }
+    return d;
+}
+
+// Return 1 if the dictionary literal base was folded to a frozendict const,
+// 0 if not applicable, -1 on error.
+static int
+codegen_optimize_dict_attr_call(compiler *c, expr_ty meth)
+{
+    if (meth->kind != Attribute_kind) {
+        return 0;
+    }
+    expr_ty dict_expr = meth->v.Attribute.value;
+    if (!is_pure_dict_literal(dict_expr)) {
+        return 0;
+    }
+
+    PyObject *attr = meth->v.Attribute.attr;
+    if (!PyUnicode_CheckExact(attr)) {
+        return 0;
+    }
+
+    static const char *const safe_attrs[] = {
+        "__iter__",
+        "__len__",
+        "get",
+        "items",
+        "keys",
+        "values",
+    };
+    int matches = 0;
+    Py_ssize_t attr_count = (Py_ssize_t)Py_ARRAY_LENGTH(safe_attrs);
+    for (Py_ssize_t i = 0; i < attr_count; i++) {
+        int eq = _PyUnicode_EqualToASCIIString(attr, safe_attrs[i]);
+        if (eq < 0) {
+            return ERROR;
+        }
+        if (eq) {
+            matches = 1;
+            break;
+        }
+    }
+    if (!matches) {
+        return 0;
+    }
+
+    PyObject *d = build_const_dict_from_literal(dict_expr);
+    if (d == NULL) {
+        if (PyErr_Occurred()) {
+            return ERROR;
+        }
+        return 0;
+    }
+    ADDOP_LOAD_CONST_NEW(c, LOC(dict_expr), d);
+    return 1;
+}
+
 // Return 1 if the method call was optimized, 0 if not, and -1 on error.
 static int
 maybe_optimize_method_call(compiler *c, expr_ty e)
@@ -3998,7 +4106,16 @@ maybe_optimize_method_call(compiler *c, expr_ty e)
         loc = update_start_location_to_match_attr(c, loc, meth);
         ADDOP(c, loc, NOP);
     } else {
-        VISIT(c, expr, meth->v.Attribute.value);
+        int used_const_base = 0;
+        if (meth->v.Attribute.value->kind == Dict_kind) {
+            used_const_base = codegen_optimize_dict_attr_call(c, meth);
+            if (used_const_base == ERROR) {
+                return ERROR;
+            }
+        }
+        if (!used_const_base) {
+            VISIT(c, expr, meth->v.Attribute.value);
+        }
         loc = update_start_location_to_match_attr(c, loc, meth);
         ADDOP_NAME(c, loc, LOAD_METHOD, meth->v.Attribute.attr, names);
     }
@@ -5523,7 +5640,22 @@ codegen_subscript(compiler *c, expr_ty e)
         RETURN_IF_ERROR(check_index(c, e->v.Subscript.value, e->v.Subscript.slice));
     }
 
-    VISIT(c, expr, e->v.Subscript.value);
+    if (ctx == Load && e->v.Subscript.value->kind == Dict_kind &&
+        is_pure_dict_literal(e->v.Subscript.value)) {
+        PyObject *d = build_const_dict_from_literal(e->v.Subscript.value);
+        if (d != NULL) {
+            ADDOP_LOAD_CONST_NEW(c, LOC(e->v.Subscript.value), d);
+        }
+        else if (PyErr_Occurred()) {
+            return ERROR;
+        }
+        else {
+            VISIT(c, expr, e->v.Subscript.value);
+        }
+    }
+    else {
+        VISIT(c, expr, e->v.Subscript.value);
+    }
     if (should_apply_two_element_slice_optimization(e->v.Subscript.slice) &&
         ctx != Del
     ) {

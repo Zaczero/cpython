@@ -95,6 +95,13 @@ PyAPI_DATA(PyTypeObject) PyDictRevIterKey_Type;
 PyAPI_DATA(PyTypeObject) PyDictRevIterItem_Type;
 PyAPI_DATA(PyTypeObject) PyDictRevIterValue_Type;
 
+/* Frozen dictionary */
+
+PyAPI_DATA(PyTypeObject) PyFrozenDict_Type;
+
+#define PyFrozenDict_Check(op) PyObject_TypeCheck((op), &PyFrozenDict_Type)
+#define PyFrozenDict_CheckExact(op) Py_IS_TYPE((op), &PyFrozenDict_Type)
+
 
 #ifndef Py_LIMITED_API
 #  define Py_CPYTHON_DICTOBJECT_H

@@ -400,6 +400,14 @@ _Py_DECREF_BUILTINS(PyObject *op)
 }
 #endif
 
+/* frozendict */
+PyAPI_FUNC(int) _PyFrozenDict_CheckExact(PyObject *op);
+PyAPI_FUNC(PyObject *) _PyFrozenDict_NewPresized(Py_ssize_t n);
+PyAPI_FUNC(int) _PyFrozenDict_SetItem(PyObject *op, PyObject *key, PyObject *value);
+PyAPI_FUNC(int) _PyFrozenDict_Freeze(PyObject *op);
+PyAPI_FUNC(int) _PyFrozenDict_Next(PyObject *op, Py_ssize_t *pos,
+                                   PyObject **key, PyObject **value);
+
 #ifdef __cplusplus
 }
 #endif

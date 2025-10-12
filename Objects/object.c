@@ -2472,6 +2472,7 @@ static PyTypeObject* static_types[] = {
     &PyDictRevIterValue_Type,
     &PyDictValues_Type,
     &PyDict_Type,
+    &PyFrozenDict_Type,
     &PyEllipsis_Type,
     &PyEnum_Type,
     &PyFilter_Type,

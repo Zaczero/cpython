@@ -19,8 +19,8 @@ are always available.  They are listed here in alphabetical order.
 | |  :func:`ascii`        | |  :func:`filter`     | |  :func:`map`        | |  **S**                |
 | |                       | |  :func:`float`      | |  :func:`max`        | |  |func-set|_          |
 | |  **B**                | |  :func:`format`     | |  |func-memoryview|_ | |  :func:`setattr`      |
-| |  :func:`bin`          | |  |func-frozenset|_  | |  :func:`min`        | |  :func:`slice`        |
-| |  :func:`bool`         | |                     | |                     | |  :func:`sorted`       |
+| |  :func:`bin`          | |  |func-frozendict|_ | |  :func:`min`        | |  :func:`slice`        |
+| |  :func:`bool`         | |  |func-frozenset|_  | |                     | |  :func:`sorted`       |
 | |  :func:`breakpoint`   | |  **G**              | |  **N**              | |  :func:`staticmethod` |
 | |  |func-bytearray|_    | |  :func:`getattr`    | |  :func:`next`       | |  |func-str|_          |
 | |  |func-bytes|_        | |  :func:`globals`    | |                     | |  :func:`sum`          |
@@ -44,6 +44,7 @@ are always available.  They are listed here in alphabetical order.
    used, with replacement texts to make the output in the table consistent
 
 .. |func-dict| replace:: ``dict()``
+.. |func-frozendict| replace:: ``frozendict()``
 .. |func-frozenset| replace:: ``frozenset()``
 .. |func-memoryview| replace:: ``memoryview()``
 .. |func-set| replace:: ``set()``
@@ -841,6 +842,25 @@ are always available.  They are listed here in alphabetical order.
    .. versionchanged:: 3.4
       ``object().__format__(format_spec)`` raises :exc:`TypeError`
       if *format_spec* is not an empty string.
+
+
+.. _func-frozendict:
+.. class:: frozendict(mapping=None, /, **kwargs)
+   :noindex:
+
+   Return a new immutable mapping built from the supplied data. The constructor
+   accepts the same argument forms as :class:`dict`:
+
+   * ``frozendict()`` creates an empty mapping.
+   * ``frozendict(mapping)`` copies another mapping.
+   * ``frozendict(iterable)`` treats the iterable as ``(key, value)`` pairs.
+   * ``frozendict(**kwargs)`` adds the provided keyword arguments.
+
+   All keys and values must be :term:`hashable`; otherwise a :exc:`TypeError`
+   is raised. The resulting object supports the standard read-only mapping API,
+   preserves insertion order, and is itself hashable, so it can be used as a
+   dictionary key or stored inside :class:`set` and :class:`frozenset`
+   containers.
 
 
 .. _func-frozenset:

@@ -218,6 +218,13 @@ class ContainerTestCase(unittest.TestCase, HelperMixin):
         for constructor in (set, frozenset):
             self.helper(constructor(self.d.keys()))
 
+    def test_frozendict(self):
+        immutable = {
+            key: tuple(value) if isinstance(value, list) else value
+            for key, value in self.d.items()
+        }
+        self.helper(frozendict(immutable))
+
 
 class BufferTestCase(unittest.TestCase, HelperMixin):
 

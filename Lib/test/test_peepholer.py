@@ -92,6 +92,44 @@ class TestTranforms(BytecodeTestCase):
         self.assertInBytecode(unot, 'POP_JUMP_IF_TRUE')
         self.check_lnotab(unot)
 
+    def test_constant_folding_dict_literal_subscript(self):
+        # {'a': 1, 'b': 2}[arg] -> use dict LOAD_CONST then NB_SUBSCR
+        def f(arg):
+            return {'a': 1, 'b': 2}[arg]
+
+        self.assertNotInBytecode(f, 'BUILD_MAP')
+        self.assertInBytecode(f, 'LOAD_CONST', {'a': 1, 'b': 2})
+        # Ensure overall behavior remains correct
+        self.assertEqual(f('a'), 1)
+        self.assertEqual(f('b'), 2)
+
+    def test_no_fold_for_unhashable_dict_values(self):
+        def f(arg):
+            return {'a': []}[arg]
+
+        self.assertInBytecode(f, 'BUILD_MAP')
+        self.assertEqual(f('a'), [])
+
+    def test_constant_folding_dict_literal_get(self):
+        def f(arg):
+            return {'a': 1}.get(arg)
+
+        self.assertNotInBytecode(f, 'BUILD_MAP')
+        self.assertInBytecode(f, 'LOAD_CONST', frozendict({'a': 1}))
+        self.assertInBytecode(f, 'CALL', 1)
+        self.assertEqual(f('a'), 1)
+        self.assertIsNone(f('missing'))
+
+    def test_constant_folding_dict_literal_get_default(self):
+        def f(arg):
+            return {'a': 1}.get(arg, 7)
+
+        self.assertNotInBytecode(f, 'BUILD_MAP')
+        self.assertInBytecode(f, 'LOAD_CONST', frozendict({'a': 1}))
+        self.assertInBytecode(f, 'CALL', 2)
+        self.assertEqual(f('a'), 1)
+        self.assertEqual(f('missing'), 7)
+
     def test_elim_inversion_of_is_or_in(self):
         for line, cmp_op, invert in (
             ('not a is b', 'IS_OP', 1,),
