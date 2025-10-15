@@ -130,7 +130,7 @@ As a consequence of this, split keys have a maximum size of 16.
 #include "pycore_pyerrors.h"      // _PyErr_GetRaisedException()
 #include "pycore_pystate.h"       // _PyThreadState_GET()
 #include "pycore_setobject.h"     // _PySet_NextEntry()
-#include "pycore_tuple.h"         // _PyTuple_Recycle()
+#include "pycore_tuple.h"         // _PyTuple_Recycle(), _PyTuple_HASH_
 #include "pycore_unicodeobject.h" // _PyUnicode_InternImmortal()
 
 #include "stringlib/eq.h"                // unicode_eq()
@@ -7885,19 +7885,23 @@ frozendict_repr(PyObject *self)
     return PyUnicode_FromFormat("frozendict(%R)", fd->fd_dict);
 }
 
-/* Match the dispersion strategy of frozenset hashing to lean on its tuning. */
-static inline Py_uhash_t
-frozendict_shuffle_bits(Py_uhash_t h)
+static Py_hash_t
+frozendict_hash(PyObject *self)
 {
-    return ((h ^ 89869747UL) ^ (h << 16)) * 3644798167UL;
-}
+    PyFrozenDictObject *fd = _Py_CAST(PyFrozenDictObject *, self);
+    Py_hash_t hash = FT_ATOMIC_LOAD_SSIZE_RELAXED(fd->fd_hash);
 
-static int
-frozendict_compute_hash(PyFrozenDictObject *fd)
-{
+    if (hash == 0) {
+        PyErr_SetString(PyExc_TypeError, "frozendict is not frozen");
+        return -1;
+    }
+    if (hash != -1) {
+        return hash;
+    }
+
     Py_ssize_t pos = 0;
     PyObject *key, *value;
-    Py_uhash_t h = 0;
+    Py_uhash_t acc = 0;
     while (PyDict_Next(fd->fd_dict, &pos, &key, &value)) {
         Py_hash_t kh = PyObject_Hash(key);
         if (kh == -1) {
@@ -7907,29 +7911,25 @@ frozendict_compute_hash(PyFrozenDictObject *fd)
         if (vh == -1) {
             return -1;
         }
-        Py_uhash_t pair_hash = (Py_uhash_t)kh ^ ((Py_uhash_t)vh << 1);
-        h ^= frozendict_shuffle_bits(pair_hash);
-    }
-    h ^= ((Py_uhash_t)PyDict_GET_SIZE(fd->fd_dict) + 1) * 1927868237UL;
-    h ^= (h >> 11) ^ (h >> 25);
-    h = h * 69069U + 907133923UL;
-    if (h == (Py_uhash_t)-1) {
-        h = 1530891417UL;
+        Py_uhash_t pair_hash = _PyTuple_HASH_XXPRIME_5;
+        pair_hash += (Py_uhash_t)kh * _PyTuple_HASH_XXPRIME_2;
+        pair_hash = _PyTuple_HASH_XXROTATE(pair_hash);
+        pair_hash *= _PyTuple_HASH_XXPRIME_1;
+        pair_hash += (Py_uhash_t)vh * _PyTuple_HASH_XXPRIME_2;
+        pair_hash = _PyTuple_HASH_XXROTATE(pair_hash);
+        pair_hash *= _PyTuple_HASH_XXPRIME_1;
+        acc ^= pair_hash;
     }
 
-    fd->fd_hash = (Py_hash_t)h;
-    return 0;
-}
+    acc += PyDict_GET_SIZE(fd->fd_dict) ^ _PyTuple_HASH_XXPRIME_5;
 
-static Py_hash_t
-frozendict_hash(PyObject *self)
-{
-    PyFrozenDictObject *fd = _Py_CAST(PyFrozenDictObject *, self);
-    if (fd->fd_hash == -1) {
-        PyErr_SetString(PyExc_TypeError, "frozendict is not frozen");
-        return -1;
+    if (acc == (Py_uhash_t)-1) {
+        acc = 1530891417UL;
     }
-    return fd->fd_hash;
+
+    hash = (Py_hash_t)acc;
+    FT_ATOMIC_STORE_SSIZE_RELAXED(fd->fd_hash, hash);
+    return hash;
 }
 
 static PyObject *
@@ -8032,10 +8032,7 @@ frozendict_from_dict(PyTypeObject *type, PyObject *dict)
         return NULL;
     }
     fd->fd_dict = dict;
-    if (frozendict_compute_hash(fd) < 0) {
-        Py_DECREF(fd);
-        return NULL;
-    }
+    fd->fd_hash = -1;
     PyObject_GC_Track(fd);
     return _Py_CAST(PyObject *, fd);
 }
@@ -8097,8 +8094,7 @@ PyTypeObject PyFrozenDict_Type = {
     .tp_hash = frozendict_hash,
     .tp_getattro = PyObject_GenericGetAttr,
     .tp_flags = Py_TPFLAGS_DEFAULT | Py_TPFLAGS_HAVE_GC |
-                Py_TPFLAGS_IMMUTABLETYPE | Py_TPFLAGS_MAPPING |
-                Py_TPFLAGS_HAVE_VECTORCALL,
+                Py_TPFLAGS_IMMUTABLETYPE | Py_TPFLAGS_MAPPING,
     .tp_doc = frozendict_doc,
     .tp_traverse = frozendict_traverse,
     .tp_clear = frozendict_clear,
@@ -8130,7 +8126,7 @@ _PyFrozenDict_NewPresized(Py_ssize_t n)
         PyObject_GC_Del(fd);
         return NULL;
     }
-    fd->fd_hash = -1;
+    fd->fd_hash = 0;
     PyObject_GC_Track(fd);
     return _Py_CAST(PyObject *, fd);
 }
@@ -8143,7 +8139,7 @@ _PyFrozenDict_SetItem(PyObject *op, PyObject *key, PyObject *value)
         return -1;
     }
     PyFrozenDictObject *fd = _Py_CAST(PyFrozenDictObject *, op);
-    if (fd->fd_hash != -1) {
+    if (FT_ATOMIC_LOAD_SSIZE_RELAXED(fd->fd_hash) != 0) {
         PyErr_SetString(PyExc_TypeError, "frozendict is frozen");
         return -1;
     }
@@ -8158,11 +8154,12 @@ _PyFrozenDict_Freeze(PyObject *op)
         return -1;
     }
     PyFrozenDictObject *fd = _Py_CAST(PyFrozenDictObject *, op);
-    if (fd->fd_hash != -1) {
+    if (FT_ATOMIC_LOAD_SSIZE_RELAXED(fd->fd_hash) != 0) {
         PyErr_SetString(PyExc_TypeError, "frozendict is already frozen");
         return -1;
     }
-    return frozendict_compute_hash(fd);
+    FT_ATOMIC_STORE_SSIZE_RELAXED(fd->fd_hash, -1);
+    return 0;
 }
 
 int

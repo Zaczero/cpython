@@ -23,10 +23,6 @@ class FrozenDictTests(unittest.TestCase):
         source['b'] = 2
         self.assertEqual(dict(fd), {'a': 1})
 
-    def test_requires_hashable_values(self):
-        with self.assertRaises(TypeError):
-            frozendict({'a': []})
-
     def test_invalid_kwargs_type(self):
         with self.assertRaises(TypeError):
             frozendict({}, **{1: 2})
@@ -44,20 +40,60 @@ class FrozenDictTests(unittest.TestCase):
         self.assertEqual(lhs, {'x': 1, 'y': 2})
         self.assertEqual(hash(lhs), hash(rhs))
 
-    def test_hash_precomputed(self):
+    def test_hash_lazy_and_cached(self):
         class CountingInt(int):
             hash_calls = 0
             def __hash__(self):
                 type(self).hash_calls += 1
                 return super().__hash__()
 
-        payload = {CountingInt(1): 1, CountingInt(2): 2}
+        payload = {CountingInt(1): CountingInt(10), CountingInt(2): CountingInt(20)}
         CountingInt.hash_calls = 0
         fd = frozendict(payload)
-        self.assertEqual(CountingInt.hash_calls, len(payload))
-        CountingInt.hash_calls = 0
-        hash(fd)
+        # Hash not computed during construction
         self.assertEqual(CountingInt.hash_calls, 0)
+
+        # First hash() call computes it
+        h1 = hash(fd)
+        first_calls = CountingInt.hash_calls
+        self.assertGreater(first_calls, 0)
+
+        # Second hash() call uses cached value
+        h2 = hash(fd)
+        self.assertEqual(CountingInt.hash_calls, first_calls)
+        self.assertEqual(h1, h2)
+
+    def test_conditionally_hashable(self):
+        # Hashable values → hashable frozendict
+        fd1 = frozendict({'a': 1, 'b': 'x', 'c': (1, 2)})
+        self.assertIsInstance(hash(fd1), int)
+
+        # Unhashable values → unhashable frozendict
+        fd2 = frozendict({'a': [], 'b': 2})
+        with self.assertRaises(TypeError) as cm:
+            hash(fd2)
+        self.assertIn('unhashable', str(cm.exception).lower())
+
+        # But can still use unhashable frozendict
+        self.assertEqual(fd2['a'], [])
+        self.assertEqual(fd2['b'], 2)
+        self.assertEqual(len(fd2), 2)
+
+        # Nested unhashable
+        fd3 = frozendict({'x': frozendict({'y': []})})
+        with self.assertRaises(TypeError):
+            hash(fd3)
+
+    def test_hash_collision_fix(self):
+        # These used to collide due to weak key-value combining
+        fd1 = frozendict({'a': 'a', 'b': 1})
+        fd2 = frozendict({'a': 'a', 'b': 'b'})
+        self.assertNotEqual(hash(fd1), hash(fd2))
+
+        # More collision tests
+        fd3 = frozendict({'x': 1, 'y': 2})
+        fd4 = frozendict({'x': 2, 'y': 1})
+        self.assertNotEqual(hash(fd3), hash(fd4))
 
     def test_pickle_roundtrip(self):
         fd = frozendict({'a': 1, 'b': 2})
